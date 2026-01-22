@@ -1,7 +1,7 @@
 #include <WiFi.h>
 
-const char* ssid = "YOUR_SSID";
-const char* password = "YOUR_PASSWORD";
+const char* ssid = "iPhone";
+const char* password = "*********";
 
 void setup() {
   Serial.begin(9600);
