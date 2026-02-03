@@ -1,4 +1,4 @@
-#include <Wifi.h>  // WiFi library (used for connecting to network + server requests)
+#include <WiFi.h>  // WiFi library (used for connecting to network + server requests)
 
 // =====================================================
 // =============== FORWARD DECLARATIONS =================
@@ -14,7 +14,7 @@ void setMotors(int leftSpeed, int rightSpeed); // Set motor direction (phase) an
 
 void buildLeg(int fromNode, int toNode);  // Run Dijkstra and build legPath[] from fromNode to toNode
 void handleMarkerHit();                   // Handle marker: decide turn at junction or notify server at node
-readUltrasonicMM()                        // Read ultrasonic distance in mm (function is defined later)
+float readUltrasonicMM();                       // Read ultrasonic distance in mm (function is defined later)
 
 // Startup guard
 void clearStartupMarker();                // Drive off a marker if starting on one (startup guard)
@@ -82,8 +82,8 @@ const int   port   = 8000;                    // Server port
 const char* teamID = "dtbv6902";              // Team identifier for API path
 WiFiClient client;                            // Client used for TCP/HTTP requests
 
-const int OBSTACLE_STOP_MM = 150;   // stop if obstacle is closer than this (mm)
-const int OBSTACLE_CLEAR_MM = 180;  // resume when distance is above this (mm) (hysteresis)
+const int OBSTACLE_STOP_MM = 30;   // stop if obstacle is closer than this (mm)
+const int OBSTACLE_CLEAR_MM = 50;  // resume when distance is above this (mm) (hysteresis)
 bool obstacleBlocked = false;       // remembers if we are currently stopped by obstacle
 
 
@@ -811,3 +811,4 @@ int notifyArrival(int position) {
 
   return body.toInt();                             // otherwise return next node ID
 }
+
