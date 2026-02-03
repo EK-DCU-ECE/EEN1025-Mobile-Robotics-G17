@@ -1,120 +1,112 @@
 #include <WiFi.h>  // WiFi library (used for connecting to network + server requests)
 
-/*
-  NOTE (ESP32 + HC-SR04 style ultrasonic):
-  - ECHO is often 5V. ESP32 GPIO is 3.3V max. Use a voltage divider / level shifter on ECHO.
-  - TRIG can be driven directly from ESP32.
-*/
-
 // =====================================================
 // =============== FORWARD DECLARATIONS =================
 // =====================================================
-void connectToWiFi();                     // Connect ESP/board to the WiFi network
-int  notifyArrival(int position);         // Send current node to server, get next target node (or Finished)
+void   connectToWiFi();                          // Connect ESP/board to the WiFi network
+int    notifyArrival(int position);              // Send current node to server, get next target node (or Finished)
 
-void readSensors();                       // Read the 5 line sensors into sensorValues[]
-bool isMarker();                          // True if all sensors detect the line condition (marker bar)
-void followLine();                        // Follow the line using proportional control (Kp)
-int  getLineError();                      // Calculate line position error (-2..2), 100 if line is lost
-void setMotors(int leftSpeed, int rightSpeed); // Set motor direction (phase) and PWM speed
+void   readSensors();                            // Read the 5 line sensors into sensorValues[]
+bool   isMarker();                               // True if all sensors detect the line condition (marker bar)
+void   followLine();                             // Follow the line using proportional control (Kp)
+int    getLineError();                           // Calculate line position error (-2..2), 100 if line is lost
+void   setMotors(int leftSpeed, int rightSpeed); // Set motor direction (phase) and PWM speed
 
-void buildLeg(int fromNode, int toNode);  // Run Dijkstra and build legPath[] from fromNode to toNode
-void handleMarkerHit();                   // Handle marker: decide turn at junction or notify server at node
-float readUltrasonicMM();                 // Read ultrasonic distance in mm (function is defined later)
-void pauseForObstacle();                  // Stop whenever obstacle is present; resume when cleared
+void   buildLeg(int fromNode, int toNode);       // Run Dijkstra and build legPath[] from fromNode to toNode
+void   handleMarkerHit();                        // Handle marker: decide turn at junction or notify server at node
+float  readUltrasonicMM();                       // Read ultrasonic distance in mm
 
-// Startup guard
-void clearStartupMarker();                // Drive off a marker if starting on one (startup guard)
+void   clearStartupMarker();                     // Drive off a marker if starting on one (startup guard)
 
-void doStraight();                        // No action (placeholder for straight)
-void doLeft90();                          // Spin left ~90 degrees then reacquire line (obstacle-aware)
-void doRight90();                         // Spin right ~90 degrees then reacquire line (obstacle-aware)
-void doUTurn();                           // Perform sensor-based U-turn and lock back onto the line (obstacle-aware)
-void reacquireLineAfterTurn(bool keepTurningLeft, bool keepTurningRight); // Search/lock line after a turn (obstacle-aware)
+void   doStraight();                             // No action (placeholder for straight)
+void   doLeft90();                               // Spin left ~90 degrees then reacquire line
+void   doRight90();                              // Spin right ~90 degrees then reacquire line
+void   doUTurn();                                // Perform sensor-based U-turn and lock back onto the line
+void   reacquireLineAfterTurn(bool keepTurningLeft, bool keepTurningRight); // Search/lock line after a turn
 
-// marker helpers
-int  countLineSensors();                  // Count how many sensors currently see the line
-bool goodLineLock();                      // Check if line lock is good (center on line, not marker)
-void resetMarkerDebounce();               // Reset marker debounce counters and latch state
-void clearMarkerSmart(bool afterTurn);    // Move forward until marker is cleared; set ignore time (obstacle-aware)
+int    countLineSensors();                       // Count how many sensors currently see the line
+bool   goodLineLock();                           // Check if line lock is good (center on line, not marker)
+void   resetMarkerDebounce();                    // Reset marker debounce counters and latch state
+void   clearMarkerSmart(bool afterTurn);         // Move forward until marker is cleared; set ignore time
 
-// Server helpers
-bool   connectToServer();                 // Open TCP connection to server:port
+bool   connectToServer();                        // Open TCP connection to server:port
 String readResponseWithTimeout(uint32_t timeoutMs); // Read HTTP response string with timeout
-int    getStatusCode(String &response);   // Extract HTTP status code (e.g., 200)
-String getResponseBody(String &response); // Extract HTTP body text after headers
-
+int    getStatusCode(String &response);          // Extract HTTP status code (e.g., 200)
+String getResponseBody(String &response);        // Extract HTTP body text after headers
 
 // =====================================================
 // ================= PINS & VARIABLES ===================
 // =====================================================
 
 // ---------- Line sensor pins + storage ----------
-int sensorPins[5] = {4, 5, 6, 7, 15};     // Pins for the 5 line sensors
-int sensorValues[5];                      // Stores analog readings from sensors
+int sensorPins[5] = {4, 5, 6, 7, 15};
+int sensorValues[5];
 
 // ---------- Motor control pins ----------
-int leftPWM    = 37;                      // Left motor PWM pin (speed)
-int leftPhase  = 38;                      // Left motor direction/phase pin
-int rightPWM   = 39;                      // Right motor PWM pin (speed)
-int rightPhase = 20;                      // Right motor direction/phase pin
+int leftPWM    = 37;
+int leftPhase  = 38;
+int rightPWM   = 39;
+int rightPhase = 20;
 
 // ---------- Ultrasonic sensor pins ----------
-const int trigPin = 17;                   // TRIG output pin (ESP32 GPIO17)
-const int echoPin = 16;                   // ECHO input pin (ESP32 GPIO26)
+const int trigPin = 17;   // TRIG output pin
+const int echoPin = 16;   // ECHO input pin (CHANGED as requested)
 
 // ---------- Line detection settings ----------
-const bool LINE_IS_BLACK = false;         // If true: line = high reading; if false: line = low reading
-int threshold = 250;                      // Threshold for seesLine() decision
+const bool LINE_IS_BLACK = false;
+int threshold = 250;
 
 // ---------- Line-following controller settings ----------
-int baseSpeed = 140;                      // Base motor speed while following line
-int Kp = 80;                              // Proportional gain for correction
-int turnSpeed = 130;                      // Speed used for turning
+int baseSpeed = 140;
+int Kp = 80;
+int turnSpeed = 130;
 
-// ---------- Timing settings (tune for your robot) ----------
-int SPIN_90_MS      = 320;                // How long to spin for ~90 degree turn
-int CLEAR_FWD_SPEED = 155;                // Speed to clear a marker bar
+// ---------- Timing settings ----------
+int SPIN_90_MS      = 320;
+int CLEAR_FWD_SPEED = 155;
 
 // ---------- Startup marker ignore ----------
-const unsigned long STARTUP_IGNORE_MS = 1500; // Ignore marker detection briefly after start
-unsigned long ignoreMarkersUntil = 0;         // Time until marker detection is enabled
+const unsigned long STARTUP_IGNORE_MS = 1500;
+unsigned long ignoreMarkersUntil = 0;
 
 // ---------- Wi-Fi / server settings ----------
-const char* ssid = "iot";                     // WiFi SSID
-const char* password = "bosselation7isacoustic"; // WiFi password
-const char* server = "3.250.38.184";          // Server IP
-const int   port   = 8000;                    // Server port
-const char* teamID = "dtbv6902";              // Team identifier for API path
-WiFiClient client;                            // Client used for TCP/HTTP requests
+const char* ssid = "iot";
+const char* password = "bosselation7isacoustic";
+const char* server = "3.250.38.184";
+const int   port   = 8000;
+const char* teamID = "dtbv6902";
+WiFiClient client;
 
-// ---------- Obstacle stop/resume settings (mm) ----------
-const int OBSTACLE_STOP_MM  = 30;   // stop if obstacle is closer than this (mm)
-const int OBSTACLE_CLEAR_MM = 50;   // resume when distance is above this (mm)
-bool obstacleBlocked = false;       // remembers if we are currently stopped by obstacle
+// ---------- Obstacle stop settings (UNCHANGED RANGE) ----------
+const int OBSTACLE_STOP_MM  = 30;   // stop if obstacle closer than this
+const int OBSTACLE_CLEAR_MM = 50;   // resume if obstacle farther than this
+bool obstacleBlocked = false;
 
+// NEW obstacle bit: require a few consecutive close readings before stopping
+int closeCount = 0;
+const int CLOSE_CONFIRM = 3;
 
 // =====================================================
 // =================== MARKER MODEL =====================
 // =====================================================
 enum MarkerID : int8_t {
-  M0 = 0,                                  // Node marker 0
-  M1 = 1,                                  // Node marker 1
-  M2 = 2,                                  // Node marker 2
-  M3 = 3,                                  // Node marker 3
-  M4 = 4,                                  // Node marker 4
-  M5 = 5,                                  // Node marker 5
-  MJ05 = 6,                                // Junction marker 0.5 (NOT a node)
-  MJ35 = 7                                 // Junction marker 3.5 (NOT a node)
+  M0 = 0,
+  M1 = 1,
+  M2 = 2,
+  M3 = 3,
+  M4 = 4,
+  M5 = 5,
+  MJ05 = 6,   // junction marker 0.5 (NOT a node)
+  MJ35 = 7    // junction marker 3.5 (NOT a node)
 };
 
-const int NUM_MARKERS = 8;                 // Total markers in enum (0..7)
+const int NUM_MARKERS = 8;
 
-bool isRealNode(MarkerID m) {              // Returns true if marker is a real node (0..5)
+bool isRealNode(MarkerID m) {
   return (m == M0 || m == M1 || m == M2 || m == M3 || m == M4 || m == M5);
 }
 
-MarkerID nodeToMarker(int node) {          // Convert node number (0..5) to MarkerID (M0..M5)
+MarkerID nodeToMarker(int node) {
   switch (node) {
     case 0: return M0;
     case 1: return M1;
@@ -122,35 +114,34 @@ MarkerID nodeToMarker(int node) {          // Convert node number (0..5) to Mark
     case 3: return M3;
     case 4: return M4;
     case 5: return M5;
-    default: return M0;                    // Default fallback
+    default: return M0;
   }
 }
 
-inline bool seesLine(int v) {              // True if sensor reading indicates line under that sensor
+inline bool seesLine(int v) {
   return LINE_IS_BLACK ? (v > threshold) : (v < threshold);
 }
-
 
 // =====================================================
 // ============== ACTIONS AT JUNCTIONS ==================
 // =====================================================
 enum Action : int8_t {
-  ACT_UNKNOWN  = -1,                       // Action not defined
-  ACT_STRAIGHT = 0,                        // Go straight through junction
-  ACT_LEFT90   = 1,                        // Turn left 90 degrees
-  ACT_RIGHT90  = 2,                        // Turn right 90 degrees
-  ACT_UTURN    = 3                         // Perform U-turn
+  ACT_UNKNOWN  = -1,
+  ACT_STRAIGHT = 0,
+  ACT_LEFT90   = 1,
+  ACT_RIGHT90  = 2,
+  ACT_UTURN    = 3
 };
 
-Action JUNC_LUT[NUM_MARKERS][NUM_MARKERS][NUM_MARKERS]; // LUT: prev, junction, next -> action
+Action JUNC_LUT[NUM_MARKERS][NUM_MARKERS][NUM_MARKERS];
 
-void initJunctionLUT() {                   // Fill junction action lookup table
+void initJunctionLUT() {
   for (int a=0; a<NUM_MARKERS; a++)
     for (int b=0; b<NUM_MARKERS; b++)
       for (int c=0; c<NUM_MARKERS; c++)
-        JUNC_LUT[a][b][c] = ACT_UNKNOWN;   // Default all to unknown
+        JUNC_LUT[a][b][c] = ACT_UNKNOWN;
 
-  // MJ05 junction rules (between nodes 0,1,2)
+  // MJ05 (0,1,2)
   JUNC_LUT[M0][MJ05][M1] = ACT_LEFT90;
   JUNC_LUT[M1][MJ05][M0] = ACT_RIGHT90;
 
@@ -160,7 +151,7 @@ void initJunctionLUT() {                   // Fill junction action lookup table
   JUNC_LUT[M1][MJ05][M2] = ACT_LEFT90;
   JUNC_LUT[M2][MJ05][M1] = ACT_RIGHT90;
 
-  // MJ35 junction rules (between nodes 1,3,4,5)
+  // MJ35 (1,3,4)
   JUNC_LUT[M1][MJ35][M3] = ACT_RIGHT90;
   JUNC_LUT[M3][MJ35][M1] = ACT_LEFT90;
 
@@ -175,52 +166,46 @@ void initJunctionLUT() {                   // Fill junction action lookup table
   JUNC_LUT[M5][MJ35][M1] = ACT_STRAIGHT;
 }
 
-
 // =====================================================
 // =========== LEG / PATH (WEIGHTED NODES) ==============
 // =====================================================
-MarkerID legPath[20];                      // Expanded marker path (nodes + junction markers)
-int legLen = 0;                            // Number of entries in legPath[]
-int legIdx = 0;                            // Current index in legPath[]
+MarkerID legPath[20];
+int legLen = 0;
+int legIdx = 0;
 
-const int NODES = 6;                       // Total real nodes (0..5)
-const int MAX_DEG = 5;                     // Max neighbors per node
+const int NODES = 6;
+const int MAX_DEG = 5;
 
-// Node adjacency list (neighbors for each node)
 int adj[NODES][MAX_DEG] = {
-  {1, 2, 4, -1, -1},      // 0 connects to 1,2,4
-  {0, 2, 3, 4, 5},        // 1 connects to 0,2,3,4,5
-  {0, 1, 3, -1, -1},      // 2 connects to 0,1,3
-  {2, 1, 4, -1, -1},      // 3 connects to 2,1,4
-  {0, 1, 3, -1, -1},      // 4 connects to 0,1,3
-  {1, -1, -1, -1, -1}     // 5 connects to 1
+  {1, 2, 4, -1, -1},
+  {0, 2, 3, 4, 5},
+  {0, 1, 3, -1, -1},
+  {2, 1, 4, -1, -1},
+  {0, 1, 3, -1, -1},
+  {1, -1, -1, -1, -1}
 };
 
-// Edge weights aligned with your model
 int w[NODES][MAX_DEG] = {
-  {3, 3, 2, -1, -1},      // costs from node 0 to neighbors
-  {3, 3, 4, 4, 4},        // costs from node 1 to neighbors
-  {3, 3, 2, -1, -1},      // costs from node 2 to neighbors
-  {2, 4, 4, -1, -1},      // costs from node 3 to neighbors
-  {2, 4, 4, -1, -1},      // costs from node 4 to neighbors
-  {4, -1, -1, -1, -1}     // costs from node 5 to neighbors
+  {3, 3, 2, -1, -1},
+  {3, 3, 4, 4, 4},
+  {3, 3, 2, -1, -1},
+  {2, 4, 4, -1, -1},
+  {2, 4, 4, -1, -1},
+  {4, -1, -1, -1, -1}
 };
 
-// Decide if traveling between nodes requires passing MJ05 junction marker
 bool usesMJ05(int a, int b) {
   return (a <= 2 && b <= 2 && a != b);
 }
 
-// Decide if traveling between nodes requires passing MJ35 junction marker
 bool usesMJ35(int a, int b) {
   bool inA = (a == 1 || a == 3 || a == 4 || a == 5);
   bool inB = (b == 1 || b == 3 || b == 4 || b == 5);
   if (!inA || !inB) return false;
-  if ((a == 3 && b == 4) || (a == 4 && b == 3)) return false; // direct edge, no junction
+  if ((a == 3 && b == 4) || (a == 4 && b == 3)) return false;
   return (a != b);
 }
 
-// Build shortest path from fromNode -> toNode, then expand to markers + junctions
 void buildLeg(int fromNode, int toNode) {
   legLen = 0;
   legIdx = 0;
@@ -303,7 +288,6 @@ void buildLeg(int fromNode, int toNode) {
   Serial.println(dist[toNode]);
 }
 
-
 // =====================================================
 // ======================= STATE ========================
 // =====================================================
@@ -313,16 +297,13 @@ bool finished   = false;
 
 MarkerID prevMarker = M0;
 
-// Marker debouncing
 int markerOnCount = 0;
 int markerOffCount = 0;
 const int MARKER_ON_CONFIRM  = 4;
 const int MARKER_OFF_CONFIRM = 4;
 bool markerLatched = false;
 
-// Turning state
 volatile bool isTurning = false;
-
 
 // =====================================================
 // ======================= SETUP ========================
@@ -354,15 +335,42 @@ void setup() {
   ignoreMarkersUntil = millis() + STARTUP_IGNORE_MS;
 }
 
-
 // =====================================================
 // ======================== LOOP ========================
 // =====================================================
 void loop() {
   if (finished) { setMotors(0, 0); return; }
 
-  // Always enforce obstacle stop/resume
-  pauseForObstacle();
+  float dmm = readUltrasonicMM();
+
+  // ================= OBSTACLE STOP / RESUME =================
+  if (obstacleBlocked) {
+    setMotors(0, 0);
+
+    // ONLY clear when we get a valid far-enough reading
+    if (dmm > OBSTACLE_CLEAR_MM) {
+      obstacleBlocked = false;
+      closeCount = 0;
+
+      resetMarkerDebounce();
+      ignoreMarkersUntil = millis() + 150;
+    }
+
+    delay(30);
+    return;
+  }
+
+  // Confirm obstacle with a few consecutive close readings
+  if (dmm > 0 && dmm < OBSTACLE_STOP_MM) closeCount++;
+  else closeCount = 0;
+
+  if (closeCount >= CLOSE_CONFIRM) {
+    obstacleBlocked = true;
+    setMotors(0, 0);
+    delay(30);
+    return;
+  }
+  // ==========================================================
 
   readSensors();
 
@@ -403,44 +411,12 @@ void loop() {
   delay(5);
 }
 
-
-// =====================================================
-// ================= OBSTACLE PAUSE =====================
-// =====================================================
-void pauseForObstacle() {
-  float dmm = readUltrasonicMM();
-
-  // Detect obstacle
-  if (dmm > 0 && dmm < OBSTACLE_STOP_MM) {
-    obstacleBlocked = true;
-  }
-
-  // If blocked, stop and wait until it clears
-  while (obstacleBlocked) {
-    setMotors(0, 0);
-    delay(30);
-
-    dmm = readUltrasonicMM();
-
-    // Clear condition: distance safely above clear threshold OR no echo
-    if (dmm < 0 || dmm > OBSTACLE_CLEAR_MM) {
-      obstacleBlocked = false;
-
-      // Prevent false marker triggers when restarting
-      resetMarkerDebounce();
-      ignoreMarkersUntil = millis() + 150;
-    }
-  }
-}
-
-
 // =====================================================
 // ============== STARTUP MARKER CLEAR ==================
 // =====================================================
 void clearStartupMarker() {
   unsigned long t0 = millis();
   while (isMarker() && (millis() - t0 < 1500)) {
-    pauseForObstacle();
     setMotors(120, 120);
     readSensors();
     delay(10);
@@ -448,7 +424,6 @@ void clearStartupMarker() {
   setMotors(0, 0);
   delay(100);
 }
-
 
 // =====================================================
 // =================== MARKER HANDLER ===================
@@ -526,7 +501,6 @@ void handleMarkerHit() {
   prevMarker = curr;
 }
 
-
 // =====================================================
 // ==================== LINE FOLLOW =====================
 // =====================================================
@@ -569,7 +543,6 @@ void followLine() {
   setMotors(L, R);
 }
 
-
 // =====================================================
 // ====================== MOTORS ========================
 // =====================================================
@@ -579,7 +552,6 @@ void setMotors(int leftSpeed, int rightSpeed) {
   analogWrite(leftPWM, abs(leftSpeed));
   analogWrite(rightPWM, abs(rightSpeed));
 }
-
 
 // =====================================================
 // ================== SENSOR HELPERS ====================
@@ -604,7 +576,6 @@ void resetMarkerDebounce() {
   markerLatched = false;
 }
 
-
 // =====================================================
 // ================ SMART CLEAR MARKER ==================
 // =====================================================
@@ -615,7 +586,6 @@ void clearMarkerSmart(bool afterTurn) {
   setMotors(CLEAR_FWD_SPEED, CLEAR_FWD_SPEED);
 
   while (millis() - t0 < 900) {
-    pauseForObstacle();
     readSensors();
     if (!isMarker()) offCount++;
     else offCount = 0;
@@ -631,7 +601,6 @@ void clearMarkerSmart(bool afterTurn) {
   ignoreMarkersUntil = millis() + (afterTurn ? 220 : 320);
 }
 
-
 // =====================================================
 // =================== BASIC MANEUVERS ==================
 // =====================================================
@@ -640,13 +609,7 @@ void doStraight() { }
 void doLeft90() {
   isTurning = true;
   setMotors(turnSpeed, -turnSpeed);
-
-  unsigned long t0 = millis();
-  while (millis() - t0 < (unsigned long)SPIN_90_MS) {
-    pauseForObstacle();
-    delay(5);
-  }
-
+  delay(SPIN_90_MS);
   reacquireLineAfterTurn(true, false);
   isTurning = false;
 }
@@ -654,13 +617,7 @@ void doLeft90() {
 void doRight90() {
   isTurning = true;
   setMotors(-turnSpeed, turnSpeed);
-
-  unsigned long t0 = millis();
-  while (millis() - t0 < (unsigned long)SPIN_90_MS) {
-    pauseForObstacle();
-    delay(5);
-  }
-
+  delay(SPIN_90_MS);
   reacquireLineAfterTurn(false, true);
   isTurning = false;
 }
@@ -668,13 +625,8 @@ void doRight90() {
 void doUTurn() {
   isTurning = true;
 
-  // move forward to leave the bar
   setMotors(140, 140);
-  unsigned long tF = millis();
-  while (millis() - tF < 160) {
-    pauseForObstacle();
-    delay(5);
-  }
+  delay(160);
 
   unsigned long t0 = millis();
 
@@ -683,17 +635,12 @@ void doUTurn() {
   const int STABLE_NEED  = 6;
 
   setMotors(turnSpeed, -turnSpeed);
-  unsigned long tMin = millis();
-  while (millis() - tMin < (unsigned long)UTURN_MIN_MS) {
-    pauseForObstacle();
-    delay(5);
-  }
+  delay(UTURN_MIN_MS);
 
   bool leftMarkerOnce = false;
   int stable = 0;
 
   while (millis() - t0 < (unsigned long)UTURN_MAX_MS) {
-    pauseForObstacle();
     readSensors();
 
     bool onBar = isMarker();
@@ -723,14 +670,9 @@ void reacquireLineAfterTurn(bool keepTurningLeft, bool keepTurningRight) {
   unsigned long t0 = millis();
 
   setMotors(120, 120);
-  unsigned long tF = millis();
-  while (millis() - tF < 120) {
-    pauseForObstacle();
-    delay(5);
-  }
+  delay(120);
 
   while (true) {
-    pauseForObstacle();
     readSensors();
 
     bool centerOnLine = seesLine(sensorValues[2]);
@@ -751,7 +693,6 @@ void reacquireLineAfterTurn(bool keepTurningLeft, bool keepTurningRight) {
   ignoreMarkersUntil = millis() + 250;
   isTurning = false;
 }
-
 
 // =====================================================
 // ================= WIFI / SERVER ======================
@@ -777,10 +718,6 @@ bool connectToServer() {
   return client.connect(server, port);
 }
 
-
-// =====================================================
-// =================== ULTRASONIC =======================
-// =====================================================
 float readUltrasonicMM() {
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
@@ -788,19 +725,13 @@ float readUltrasonicMM() {
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  // timeout prevents blocking forever (e.g., 25ms ≈ 4m range)
   unsigned long duration = pulseIn(echoPin, HIGH, 25000);
-
   if (duration == 0) return -1;
 
   float distance_mm = ((duration * 0.0343) / 2.0) * 10.0;
   return distance_mm;
 }
 
-
-// =====================================================
-// ================= HTTP HELPERS =======================
-// =====================================================
 String readResponseWithTimeout(uint32_t timeoutMs) {
   String resp;
   unsigned long deadline = millis() + timeoutMs;
@@ -850,4 +781,5 @@ int notifyArrival(int position) {
 
   return body.toInt();
 }
+
 
