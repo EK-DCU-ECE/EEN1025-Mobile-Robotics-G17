@@ -1,5 +1,14 @@
 #include <WiFi.h>
 
+
+// ===============================
+// ===== BLOCKED SEGMENT STATE =====
+// We block MARKER->MARKER segments (NOT node->node) so obstacles can be anywhere
+// on the track (including between a junction bar and a node).
+// Declared after NUM_MARKERS.
+// ===============================
+
+
 // ===============================
 // ===== FORWARD DECLARATIONS =====
 // ===============================
@@ -36,17 +45,16 @@ String readResponseWithTimeout(uint32_t timeoutMs);
 int    getStatusCode(String &response);
 String getResponseBody(String &response);
 
-// ===== ULTRASONIC =====
-int  readUltrasonicCmFast();
+// ===== ULTRASONIC (ADDED) =====
+int readUltrasonicCmFast();
 
-// ===== WALL AS NODE 5 =====
+// ===== WALL AS NODE 5 (ADDED) =====
 void arriveAtWallNode5();
 
-// ===== OBSTACLE RETURN =====
+// ===== OBSTACLE RETURN (ADDED) =====
 void startReturnToPreviousNode();
 int  findNextNodeInLeg(int startIdx);
 void clearBlockedSeg();
-void blockCurrentPlannedSegment();   // NEW
 
 
 // ===============================
@@ -61,11 +69,11 @@ int leftPhase  = 38;
 int rightPWM   = 39;
 int rightPhase = 20;
 
-// ===== ULTRASONIC =====
-const int US_TRIG = 17;
-const int US_ECHO = 16;      // must be 3.3V safe on ESP32!
-const int STOP_CM  = 5;
-const int CLEAR_CM = 8;
+// ===== ULTRASONIC (ADDED) =====
+const int US_TRIG = 17;      // trig pin
+const int US_ECHO = 16;      // echo pin (must be 3.3V safe on ESP32!)
+const int STOP_CM  = 5;      // stop at 5cm
+const int CLEAR_CM = 8;      // resume at 8cm (hysteresis)
 const unsigned long US_PERIOD_MS = 60;
 
 int usCm = -1;
@@ -82,6 +90,15 @@ int threshold = 250;
 int baseSpeed = 140;
 int Kp = 80;
 int turnSpeed = 130;
+
+// ===============================
+// Line-follow disable after MJ35 -> M5 (2s after leaving junction)
+// ===============================
+bool lineFollowEnabled = true;
+bool lfDisableArmed = false;
+uint32_t lfDisableAtMs = 0;
+const uint32_t LF_DISABLE_DELAY_MS = 2000;
+
 
 // Timing (tune these)
 int SPIN_90_MS      = 320;
@@ -117,6 +134,7 @@ const int NUM_MARKERS = 8;
 
 // Blocked marker-to-marker segments (both directions)
 bool blockedSeg[NUM_MARKERS][NUM_MARKERS];
+
 
 bool isRealNode(MarkerID m) {
   return (m == M0 || m == M1 || m == M2 || m == M3 || m == M4 || m == M5);
@@ -185,6 +203,9 @@ void initJunctionLUT() {
 
 // ===============================
 // ===== LEG / PATH (WEIGHTED MARKERS) =====
+// We plan directly over markers: M0..M5 plus junctions MJ05/MJ35.
+// This makes obstacle-blocking robust because we can block the exact segment
+// we were travelling on: legPath[legIdx] -> legPath[legIdx+1].
 // ===============================
 MarkerID legPath[24];
 int legLen = 0;
@@ -204,7 +225,10 @@ int madj[NUM_MARKERS][MAX_MDEG] = {
   /* MJ35*/ {M1,   M3,   M4,  M5}
 };
 
-// Segment weights
+// Segment weights (tuned to preserve your old preferences as closely as possible)
+// - Direct bottom/top segments stay cheap (2): M0<->M4, M2<->M3
+// - MJ35 hub: M1<->MJ35 is very cheap (1), spokes to M3/M4/M5 are 3 (so 1->3 costs 4 like before)
+// - MJ05 hub: set to 2 per spoke (so 0<->1 costs 4, slightly less attractive than before; stable + consistent)
 int mw[NUM_MARKERS][MAX_MDEG] = {
   /* M0  */ {1, 2,  -1, -1},
   /* M1  */ {1, 1,  -1, -1},
@@ -222,7 +246,7 @@ void clearBlockedSeg() {
       blockedSeg[i][j] = false;
 }
 
-// Dijkstra over marker graph
+// Dijkstra over marker graph (M0..M5 + MJ05/MJ35)
 void buildLeg(int fromNode, int toNode) {
   legLen = 0;
   legIdx = 0;
@@ -258,6 +282,7 @@ void buildLeg(int fromNode, int toNode) {
       int ww = mw[u][k];
       if (ww < 0) continue;
 
+      // Skip blocked segment (treat as undirected segment)
       if (blockedSeg[u][v] || blockedSeg[v][u]) continue;
 
       if (dist[u] + ww < dist[v]) {
@@ -278,6 +303,7 @@ void buildLeg(int fromNode, int toNode) {
   }
 
   if (mlen == 0 || mp[mlen-1] != (int)fromM) {
+    // If blocked segments made it disconnected, retry once with all blocks cleared.
     bool hadAny = false;
     for (int i=0; i<NUM_MARKERS; i++)
       for (int j=0; j<NUM_MARKERS; j++)
@@ -290,15 +316,18 @@ void buildLeg(int fromNode, int toNode) {
       return;
     }
 
+    // Fallback: direct (should be rare)
     legPath[0] = fromM;
     legPath[1] = toM;
     legLen = 2;
   } else {
+    // reverse into legPath
     for (int i=0; i<mlen/2; i++) {
       int tmp = mp[i];
       mp[i] = mp[mlen-1-i];
       mp[mlen-1-i] = tmp;
     }
+
     legLen = 0;
     for (int i=0; i<mlen && legLen < 23; i++) {
       legPath[legLen++] = (MarkerID)mp[i];
@@ -310,7 +339,8 @@ void buildLeg(int fromNode, int toNode) {
     Serial.print((int)legPath[i]);
     if (i < legLen-1) Serial.print(" -> ");
   }
-  Serial.println();
+  Serial.print("   cost=");
+  Serial.println(dist[(int)toM]);
 }
 
 
@@ -323,7 +353,13 @@ bool finished   = false;
 
 MarkerID prevMarker = M0;
 
-// ===== Junction U-turn "came-from" override =====
+
+
+// ===== Junction U-turn "came-from" override (ADDED) =====
+// After an obstacle-triggered U-turn, the first marker we re-hit can be the same
+// junction marker (MJ05/MJ35). In that moment, prevMarker is ambiguous and the
+// junction LUT can fall back to STRAIGHT -> outer loop. These flags force a valid
+// "came from" marker for the first marker-hit after the U-turn.
 bool     overridePrevMarker = false;
 MarkerID forcedPrevMarker   = M0;
 
@@ -337,12 +373,14 @@ bool markerLatched = false;
 // Turning guard
 volatile bool isTurning = false;
 
-// ===== OBSTACLE RETURN STATE =====
-bool returningToPrev = false;
-bool atPrevNodeWaiting = false;
-int  savedTargetNode = -1;
+// ===============================
+// ===== OBSTACLE RETURN STATE (ADDED) =====
+// ===============================
+bool returningToPrev = false;     // reversing along legPath
+bool atPrevNodeWaiting = false;   // stopped at previous node waiting for obstacle clear
+int  savedTargetNode = -1;        // optional: remembers where we were heading
 
-
+// Blocked edge (ADDED): avoid the segment where obstacle was detected
 // ===============================
 // ===== SETUP =====
 // ===============================
@@ -353,6 +391,7 @@ void setup() {
   pinMode(leftPWM, OUTPUT);   pinMode(leftPhase, OUTPUT);
   pinMode(rightPWM, OUTPUT);  pinMode(rightPhase, OUTPUT);
 
+  // ===== ULTRASONIC SETUP (ADDED) =====
   pinMode(US_TRIG, OUTPUT);
   pinMode(US_ECHO, INPUT);
   digitalWrite(US_TRIG, LOW);
@@ -370,11 +409,16 @@ void setup() {
 
   readSensors();
 
-  // Startup: if first leg is 0->4, do immediate U-turn before moving off bar
+  // ==========================================================
+  // FIX: If the FIRST leg is 0 -> 4, do the U-turn IMMEDIATELY
+  // BEFORE any forward "startup clear" motion.
+  // This prevents accidentally hitting MJ05 first and desyncing
+  // the legPath [M0, M4].
+  // ==========================================================
   if (currentNode == 0 && targetNode == 4) {
     Serial.println("Startup optimization: target is 4 -> immediate U-turn at node 0");
     doUTurn();
-    clearMarkerSmart(true);
+    clearMarkerSmart(true); // drive off the node bar AFTER the turn
   } else {
     clearStartupMarker();
   }
@@ -395,50 +439,61 @@ void loop() {
     return;
   }
 
-  // ultrasonic update
+  // ===== ULTRASONIC STOP (ADDED) =====
+  // update distance every ~60ms (doesn't slow navigation)
   if (millis() - lastUSms >= US_PERIOD_MS) {
     lastUSms = millis();
     usCm = readUltrasonicCmFast();
   }
 
+  // Don't interfere while sitting on a marker bar
   bool onBar = isMarker();
 
-  // ===== WAITING AT PREV NODE =====
-  if (!onBar && atPrevNodeWaiting) {
-    setMotors(0, 0);
+  // ===== OBSTACLE BEHAVIOUR: RETURN TO PREVIOUS NODE =====
+  if (!onBar) {
 
-    if (usCm <= 0 || usCm >= CLEAR_CM) {
-      Serial.println("Obstacle cleared at previous node. Replanning...");
+    // If we already returned and we're waiting on the node, just hold position
+    if (atPrevNodeWaiting) {
+      setMotors(0, 0);
 
-      atPrevNodeWaiting = false;
+      // resume only when obstacle clears
+      if (usCm <= 0 || usCm >= CLEAR_CM) {
+        Serial.println("Obstacle cleared at previous node. Replanning to original target...");
 
-      if (savedTargetNode >= 0) {
-        targetNode = savedTargetNode;
-        buildLeg(currentNode, targetNode);
-      } else {
-        int nextDest = notifyArrival(currentNode);
-        if (nextDest == -2) { finished = true; return; }
-        if (nextDest < 0)   { finished = true; return; }
-        targetNode = nextDest;
-        buildLeg(currentNode, targetNode);
+        atPrevNodeWaiting = false;
+
+        // Replan to the original target (the one that was blocked), avoiding the blocked edge
+        if (savedTargetNode >= 0) {
+          targetNode = savedTargetNode;
+          buildLeg(currentNode, targetNode);
+        } else {
+          // fallback if savedTargetNode somehow invalid
+          int nextDest = notifyArrival(currentNode);
+          if (nextDest == -2) { finished = true; return; }
+          if (nextDest < 0)   { finished = true; return; }
+          targetNode = nextDest;
+          buildLeg(currentNode, targetNode);
+        }
+
+        prevMarker = nodeToMarker(currentNode);
+        legIdx = 0;
+        resetMarkerDebounce();
+        clearMarkerSmart(false);
+        ignoreMarkersUntil = millis() + 900;
       }
 
-      // IMPORTANT: reset + suppress so we don't phantom-count the node bar
-      legIdx = 0;
-      prevMarker = nodeToMarker(currentNode);
-      resetMarkerDebounce();
-      clearMarkerSmart(false);
-      ignoreMarkersUntil = millis() + 900;
+      delay(5);
+      return;
     }
 
-    delay(5);
-    return;
-  }
-
-  // ===== OBSTACLE DETECT =====
-  if (!onBar && !returningToPrev && !atPrevNodeWaiting) {
-    if (usCm > 0 && usCm <= STOP_CM) {
-      if (targetNode == 5) { arriveAtWallNode5(); return; }
+    // If we detect obstacle, trigger the return routine
+    if (!returningToPrev && usCm > 0 && usCm <= STOP_CM) {
+      // SPECIAL CASE: treat the wall as "arrival at node 5" when heading to node 5.
+      // This is your parking behaviour: stop and tell the server we're at node 5.
+      if (targetNode == 5) {
+        arriveAtWallNode5();
+        return;
+      }
 
       setMotors(0, 0);
       delay(60);
@@ -448,16 +503,29 @@ void loop() {
     }
   }
 
+  // ===== LINE FOLLOW DISABLE TIMER (MJ35 -> M5) =====
+  if (lfDisableArmed && (int32_t)(millis() - lfDisableAtMs) >= 0) {
+    lfDisableArmed = false;
+    lineFollowEnabled = false;
+    Serial.println("Line following DISABLED (2s after leaving MJ35 toward M5).");
+  }
+
   if (millis() < ignoreMarkersUntil) {
-    followLine();
+    if (lineFollowEnabled) followLine();
+    else setMotors(baseSpeed, baseSpeed);
     delay(5);
     return;
   }
 
   bool m = isMarker();
 
-  if (m) { markerOnCount++; markerOffCount = 0; }
-  else   { markerOffCount++; markerOnCount = 0; }
+  if (m) {
+    markerOnCount++;
+    markerOffCount = 0;
+  } else {
+    markerOffCount++;
+    markerOnCount = 0;
+  }
 
   if (markerOnCount >= MARKER_ON_CONFIRM && !markerLatched) {
     markerLatched = true;
@@ -469,7 +537,8 @@ void loop() {
   }
 
   if (!markerLatched && millis() >= ignoreMarkersUntil) {
-    followLine();
+    if (lineFollowEnabled) followLine();
+    else setMotors(baseSpeed, baseSpeed);
   }
 
   delay(5);
@@ -496,22 +565,26 @@ void handleMarkerHit() {
   setMotors(0, 0);
   delay(120);
 
-  // FIX: apply override BEFORE capturing cameFrom
+  // Apply forced "came-from" marker once (used after obstacle U-turn near junctions)
   if (overridePrevMarker) {
     prevMarker = forcedPrevMarker;
     overridePrevMarker = false;
     Serial.print("Applied forced prevMarker: ");
     Serial.println((int)prevMarker);
   }
+
   MarkerID cameFrom = prevMarker;
 
-  // =========================================
+
+// =========================================
   // RETURN MODE: walk legPath backwards
   // =========================================
   if (returningToPrev) {
+    // Step backwards along the already-built legPath
     if (legIdx > 0) legIdx--;
     MarkerID curr = legPath[legIdx];
 
+    // In reverse, "next" is the marker behind us (lower index)
     MarkerID next = curr;
     if (legIdx > 0) next = legPath[legIdx - 1];
 
@@ -519,6 +592,7 @@ void handleMarkerHit() {
     Serial.print(" curr="); Serial.print((int)curr);
     Serial.print(" next="); Serial.println((int)next);
 
+    // Junction marker
     if (curr == MJ05 || curr == MJ35) {
       Action a = JUNC_LUT[prevMarker][curr][next];
       if (a == ACT_UNKNOWN) a = ACT_STRAIGHT;
@@ -529,10 +603,20 @@ void handleMarkerHit() {
       else if (a == ACT_UTURN) doUTurn();
 
       clearMarkerSmart(true);
-      prevMarker = curr;
+
+    // If we just left MJ35 heading to node 5, disable line following after 2 seconds
+    if (curr == MJ35 && next == M5) {
+      lineFollowEnabled = true; // keep following as we exit the junction
+      lfDisableArmed = true;
+      lfDisableAtMs = millis() + LF_DISABLE_DELAY_MS;
+      Serial.println("Armed line-follow disable timer for MJ35 -> M5 (2s). ");
+    }
+
+    prevMarker = curr;
       return;
     }
 
+    // If we reached the previous node (start of this leg), stop and wait
     if (isRealNode(curr) && (int)curr == currentNode) {
       Serial.println("Returned to previous node. Waiting for obstacle to clear...");
 
@@ -576,6 +660,15 @@ void handleMarkerHit() {
     else if (a == ACT_UTURN) doUTurn();
 
     clearMarkerSmart(true);
+
+    // If we just left MJ35 heading to node 5, disable line following after 2 seconds
+    if (curr == MJ35 && next == M5) {
+      lineFollowEnabled = true; // keep following as we exit the junction
+      lfDisableArmed = true;
+      lfDisableAtMs = millis() + LF_DISABLE_DELAY_MS;
+      Serial.println("Armed line-follow disable timer for MJ35 -> M5 (2s). ");
+    }
+
     prevMarker = curr;
     return;
   }
@@ -584,25 +677,44 @@ void handleMarkerHit() {
   if (isRealNode(curr)) {
     int arrivedNode = (int)curr;
 
+    // Re-enable line following when we reach any real node
+    lineFollowEnabled = true;
+    lfDisableArmed = false;
+
     Serial.print("Arrived at node "); Serial.println(arrivedNode);
 
     if (arrivedNode == targetNode) {
       currentNode = targetNode;
-
-      // Optional: clear blocks once a target is reached (depends on your strategy)
-      // clearBlockedSeg();
-
+      // We made it to the target; allow previously blocked edge again
+      clearBlockedSeg();
       int nextDest = notifyArrival(currentNode);
-      if (nextDest == -2) { finished = true; setMotors(0, 0); return; }
-      if (nextDest < 0)   { finished = true; return; }
+
+      if (nextDest == -2) {
+        finished = true;
+        setMotors(0, 0);
+        Serial.println("Server says Finished.");
+        return;
+      }
+      if (nextDest < 0) {
+        Serial.println("Server error. Stopping.");
+        finished = true;
+        return;
+      }
 
       targetNode = nextDest;
       buildLeg(currentNode, targetNode);
 
-      // If next leg goes back the way we came -> U-turn at node
-      if (legLen >= 2 && legPath[1] == cameFrom) {
-        Serial.println("Next leg goes back the way we came -> U-turn at node");
+      // IMMEDIATE OPTIMIZATION RULE:
+      // If next leg is 0 -> 4, do a U-turn at node 0 immediately (don't drive away first)
+      if (currentNode == 0 && targetNode == 4) {
+        Serial.println("Optimization: at node 0 heading to 4 -> immediate U-turn");
         doUTurn();
+      } else {
+        // Otherwise, keep your existing "go back where we came from" rule
+        if (legLen >= 2 && legPath[1] == cameFrom) {
+          Serial.println("Next leg goes back the way we came -> U-turn at node");
+          doUTurn();
+        }
       }
 
       clearMarkerSmart(false);
@@ -678,9 +790,9 @@ int countLineSensors() {
 
 bool goodLineLock() {
   int c = countLineSensors();
-  if (c == 5) return false;
+  if (c == 5) return false;                 // marker bar
   if (!seesLine(sensorValues[2])) return false;
-  if (c < 1 || c > 3) return false;
+  if (c < 1 || c > 3) return false;         // narrow-ish line
   return true;
 }
 
@@ -691,58 +803,60 @@ void resetMarkerDebounce() {
 }
 
 // ===============================
-// ===== BLOCK SEGMENT (FIXED) =====
-// Block the segment we are *actually trying to travel next*:
-// prevMarker -> legPath[legIdx+1]
-// ===============================
-void blockCurrentPlannedSegment() {
-  if (legLen < 2) return;
-  if (legIdx + 1 >= legLen) return;
-
-  int u = (int)prevMarker;
-  int v = (int)legPath[legIdx + 1];
-
-  blockedSeg[u][v] = true;
-  blockedSeg[v][u] = true;
-
-  Serial.print("Blocking PLANNED segment ");
-  Serial.print(u); Serial.print(" <-> "); Serial.println(v);
-}
-
-// ===============================
-// ===== START RETURN ROUTINE (FIXED) =====
+// ===== START RETURN ROUTINE (ADDED) =====
 // ===============================
 void startReturnToPreviousNode() {
   if (returningToPrev || atPrevNodeWaiting) return;
 
-  Serial.println("OBSTACLE: U-turn and replan/return...");
+  Serial.println("OBSTACLE: U-turn and return to previous node (and replan)...");
 
+  // Remember where we were going
   savedTargetNode = targetNode;
 
-  // IMPORTANT: block the segment we were about to traverse
-  blockCurrentPlannedSegment();
-
-  // If currently at a junction marker, force prevMarker after U-turn
-  if (legIdx >= 0 && legIdx < legLen && (legPath[legIdx] == MJ05 || legPath[legIdx] == MJ35)) {
-    if (legIdx + 1 < legLen) {
-      forcedPrevMarker = legPath[legIdx + 1];
-      overridePrevMarker = true;
-      Serial.print("Forcing prevMarker after U-turn to: ");
-      Serial.println((int)forcedPrevMarker);
-    }
+  // Mark the *planned* marker segment as blocked (use prevMarker -> next planned marker)
+  // This is more reliable than legPath[legIdx] because legIdx can lag/lead around a junction.
+  if ((legIdx + 1) < legLen) {
+    int u = (int)prevMarker;
+    int v = (int)legPath[legIdx + 1];
+    blockedSeg[u][v] = true;
+    blockedSeg[v][u] = true;
+    Serial.print("Blocking planned segment "); Serial.print(u);
+    Serial.print(" <-> "); Serial.println(v);
+  } else {
+    Serial.println("WARN: Can't block segment (no next marker in legPath).");
   }
+
+// Flip around
+  
+
+// If the last marker we hit was a junction (MJ05/MJ35), then after the U-turn
+// the first marker we will hit again is typically that SAME junction. Using
+// prevMarker==junction makes the LUT index [MJxx][MJxx][next] -> ACT_UNKNOWN,
+// which defaults to STRAIGHT and sends the robot onto the outer loop.
+// Force prevMarker to be the marker we were heading toward in the forward direction.
+if (legIdx >= 0 && legIdx < legLen && (legPath[legIdx] == MJ05 || legPath[legIdx] == MJ35)) {
+  if (legIdx + 1 < legLen) {
+    forcedPrevMarker = legPath[legIdx + 1];  // forward-direction "came from"
+    overridePrevMarker = true;
+    Serial.print("Forcing prevMarker after U-turn to: ");
+    Serial.println((int)forcedPrevMarker);
+  }
+}
 
   doUTurn();
 
-  // FIX: DO NOT "wait at junction" (that causes infinite reattempt loops).
-  // Instead, replan immediately from currentNode using the blocked segment.
+  // ==========================================================
+  // FIX: If obstacle happens near a junction, don't "wait and retry".
+  // Replan immediately using the blocked segment so we take an alternate route.
+  // ==========================================================
   if (prevMarker == MJ05 || prevMarker == MJ35) {
-    Serial.println("Obstacle near junction -> replanning immediately (no wait).");
-
+    Serial.println("Obstacle near junction -> replanning immediately using blocked segment.");
+    setMotors(0, 0);
     returningToPrev = false;
     atPrevNodeWaiting = false;
 
-    targetNode = savedTargetNode;
+    // Rebuild leg to the saved target (blocked segment remains set)
+    if (savedTargetNode >= 0) targetNode = savedTargetNode;
     buildLeg(currentNode, targetNode);
 
     legIdx = 0;
@@ -755,16 +869,19 @@ void startReturnToPreviousNode() {
     return;
   }
 
+  // ensure we don't double-trigger a marker immediately after turning
   resetMarkerDebounce();
-  ignoreMarkersUntil = millis() + 300;
+  ignoreMarkersUntil = millis() + 250;
 
   returningToPrev = true;
   obstacleBlocked = false;
 }
 
 // ===============================
-// ===== LEG HELPERS =====
+// ===== LEG HELPERS (ADDED) =====
 // ===============================
+// Find the next REAL node marker ahead in legPath, starting at index startIdx.
+// Returns node number 0..5, or -1 if none found.
 int findNextNodeInLeg(int startIdx) {
   for (int i = startIdx; i < legLen; i++) {
     if (isRealNode(legPath[i])) return (int)legPath[i];
@@ -773,34 +890,48 @@ int findNextNodeInLeg(int startIdx) {
 }
 
 // ===============================
-// ===== WALL AS NODE 5 =====
+// ===== WALL AS NODE 5 (ADDED) =====
+// If we're heading to node 5 and we see the wall (ultrasonic <= STOP_CM),
+// stop immediately and report "arrived at node 5" to the server.
 // ===============================
 void arriveAtWallNode5() {
   Serial.println("Wall detected while heading to node 5 -> treating as ARRIVAL at node 5.");
 
+  // Hard stop
   setMotors(0, 0);
   delay(80);
 
+  // Cancel any obstacle-return behaviour (we're done parking)
   returningToPrev = false;
   atPrevNodeWaiting = false;
   savedTargetNode = -1;
 
+  // Cancel the MJ35->M5 line-follow disable timer (we're stopped anyway)
+  lfDisableArmed = false;
+  lineFollowEnabled = true;
+
+  // Snap state to node 5
   currentNode = 5;
   targetNode = -1;
   prevMarker = M5;
   legLen = 0;
   legIdx = 0;
 
+  // Tell server we've arrived at node 5
   int nextDest = notifyArrival(5);
-  if (nextDest == -2) { finished = true; return; }
+  if (nextDest == -2) {
+    finished = true;
+    return;
+  }
 
+  // If server gives another target, continue from node 5
   if (nextDest >= 0) {
     targetNode = nextDest;
     buildLeg(currentNode, targetNode);
     prevMarker = nodeToMarker(currentNode);
     clearMarkerSmart(false);
-    ignoreMarkersUntil = millis() + 900;
   } else {
+    // If server returns invalid/negative (other than -2), just hold.
     finished = true;
   }
 }
@@ -813,6 +944,7 @@ void clearMarkerSmart(bool afterTurn) {
   int offCount = 0;
   int lockCount = 0;
 
+  // Push forward off the bar and wait until we're back on a "normal" line pattern.
   setMotors(CLEAR_FWD_SPEED, CLEAR_FWD_SPEED);
 
   while (millis() - t0 < 1200) {
@@ -821,6 +953,7 @@ void clearMarkerSmart(bool afterTurn) {
     if (!isMarker()) offCount++;
     else offCount = 0;
 
+    // Require a few consecutive "good line" reads so we don't re-trigger the same bar
     if (!isMarker() && goodLineLock()) lockCount++;
     else lockCount = 0;
 
@@ -833,7 +966,9 @@ void clearMarkerSmart(bool afterTurn) {
   delay(50);
 
   resetMarkerDebounce();
-  ignoreMarkersUntil = millis() + (afterTurn ? 700 : 500);
+
+  // Stronger cooldown after turns/junctions to prevent legIdx skipping on the same bar
+  ignoreMarkersUntil = millis() + (afterTurn ? 650 : 450);
 }
 
 // ===============================
@@ -861,6 +996,7 @@ void doRight90() {
 void doUTurn() {
   isTurning = true;
 
+  // move forward to leave the bar
   setMotors(140, 140);
   delay(160);
 
@@ -870,7 +1006,7 @@ void doUTurn() {
   const int UTURN_MAX_MS = 2300;
   const int STABLE_NEED  = 6;
 
-  setMotors(turnSpeed, -turnSpeed);
+  setMotors(turnSpeed, -turnSpeed); // left
   delay(UTURN_MIN_MS);
 
   bool leftMarkerOnce = false;
@@ -895,7 +1031,7 @@ void doUTurn() {
   delay(80);
 
   resetMarkerDebounce();
-  ignoreMarkersUntil = millis() + 350;
+  ignoreMarkersUntil = millis() + 280;
 
   isTurning = false;
 }
@@ -926,7 +1062,7 @@ void reacquireLineAfterTurn(bool keepTurningLeft, bool keepTurningRight) {
   setMotors(0, 0);
   delay(80);
 
-  ignoreMarkersUntil = millis() + 300;
+  ignoreMarkersUntil = millis() + 250;
   isTurning = false;
 }
 
@@ -1004,8 +1140,11 @@ int notifyArrival(int position) {
   return body.toInt();
 }
 
+
 // ===============================
-// ===== ULTRASONIC FUNCTION =====
+// ===== ULTRASONIC FUNCTION (ADDED) =====
+// Short timeout to avoid breaking navigation timing.
+// Returns cm, or -1 if no echo.
 // ===============================
 int readUltrasonicCmFast() {
   digitalWrite(US_TRIG, LOW);
@@ -1014,8 +1153,9 @@ int readUltrasonicCmFast() {
   delayMicroseconds(10);
   digitalWrite(US_TRIG, LOW);
 
+  // 8000us timeout keeps loop responsive (we only care about close objects)
   unsigned long us = pulseIn(US_ECHO, HIGH, 8000UL);
   if (us == 0) return -1;
 
-  return (int)(us / 58.0);
+  return (int)(us / 58.0); // microseconds -> cm
 }
