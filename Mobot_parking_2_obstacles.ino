@@ -541,7 +541,7 @@ const uint32_t OBST_OVERRIDE_TTL_MS = 5000;
 // Debounced marker state
 int markerOnCount = 0;
 int markerOffCount = 0;
-const int MARKER_ON_CONFIRM  = 5;
+const int MARKER_ON_CONFIRM  = 1;
 const int MARKER_OFF_CONFIRM = 4;
 bool markerLatched = false;
 
